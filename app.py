@@ -14,6 +14,7 @@ the $110M SEC registration threshold and surfacing high-growth targets.
 
 import io
 import json
+import os
 import re
 import tempfile
 import time
@@ -241,11 +242,42 @@ def _render_workflow_status(stats):
 
 
 # ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+def _check_password():
+    """Gate access with a password stored in st.secrets or env."""
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.markdown("<br>" * 3, unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.title("SurgeOne")
+        st.caption("RIA Growth Tracker · Bhavsar Growth Consulting")
+        st.divider()
+        password = st.text_input("Enter password", type="password", key="login_pw")
+        if st.button("Sign in", type="primary", use_container_width=True):
+            try:
+                correct = st.secrets["APP_PASSWORD"]
+            except (KeyError, FileNotFoundError):
+                correct = os.getenv("APP_PASSWORD", "")
+            if password and password == correct:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Main App
 # ---------------------------------------------------------------------------
 
 def main():
     init_db()
+    if not _check_password():
+        return
     _inject_css()
     stats = get_pipeline_stats()
 
