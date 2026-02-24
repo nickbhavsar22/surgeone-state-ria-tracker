@@ -1,0 +1,686 @@
+"""
+SQLite database layer for State-Registered RIA Growth Tracker.
+
+Provides persistent caching for all pipeline stages: firm data,
+AUM history snapshots, growth scores, CCO/contact info, and exports.
+"""
+
+import sqlite3
+from datetime import datetime, timedelta
+from pathlib import Path
+
+DB_DIR = Path(__file__).resolve().parent.parent
+DB_PATH = DB_DIR / "ria_growth_tracker.db"
+
+
+def get_connection(db_path=None, foreign_keys=True):
+    """Get a SQLite connection with WAL mode for concurrent reads."""
+    path = db_path or DB_PATH
+    conn = sqlite3.connect(str(path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    if foreign_keys:
+        conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db(db_path=None):
+    """Create all tables if they don't exist."""
+    conn = get_connection(db_path)
+    try:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS firms (
+                crd                     INTEGER PRIMARY KEY,
+                company                 TEXT,
+                legal_name              TEXT,
+                state                   TEXT,
+                city                    TEXT,
+                phone                   TEXT,
+                website                 TEXT,
+                aum                     INTEGER,
+                aum_discretionary       INTEGER,
+                aum_nondiscretionary    INTEGER,
+                employees               INTEGER,
+                clients                 INTEGER,
+                sec_registered          TEXT,
+                filing_date             TEXT,
+                status                  TEXT,
+                imported_at             TEXT,
+                updated_at              TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS aum_history (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                crd                     INTEGER,
+                snapshot_date           TEXT,
+                aum                     INTEGER,
+                aum_discretionary       INTEGER,
+                employees               INTEGER,
+                clients                 INTEGER,
+                UNIQUE(crd, snapshot_date)
+            );
+
+            CREATE TABLE IF NOT EXISTS growth_scores (
+                crd                     INTEGER PRIMARY KEY,
+                yoy_growth_latest       REAL,
+                yoy_growth_avg          REAL,
+                growth_years            INTEGER,
+                proximity_score         REAL,
+                acceleration            REAL,
+                composite_score         REAL,
+                tier                    TEXT,
+                score_details           TEXT,
+                scored_at               TEXT,
+                FOREIGN KEY (crd) REFERENCES firms(crd)
+            );
+
+            CREATE TABLE IF NOT EXISTS form_adv_details (
+                crd                     INTEGER PRIMARY KEY,
+                cco_name                TEXT,
+                cco_email               TEXT,
+                cco_phone               TEXT,
+                state_registrations     TEXT,
+                state_count             INTEGER,
+                scraped_at              TEXT,
+                FOREIGN KEY (crd) REFERENCES firms(crd)
+            );
+
+            CREATE TABLE IF NOT EXISTS contacts (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                crd                     INTEGER,
+                contact_name            TEXT,
+                first_name              TEXT,
+                last_name               TEXT,
+                contact_email           TEXT,
+                contact_title           TEXT,
+                contact_phone           TEXT,
+                contact_linkedin        TEXT,
+                source                  TEXT,
+                confidence              REAL,
+                enriched_at             TEXT,
+                FOREIGN KEY (crd) REFERENCES firms(crd)
+            );
+
+            CREATE TABLE IF NOT EXISTS enrichment_log (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                crd                     INTEGER,
+                api_source              TEXT,
+                endpoint                TEXT,
+                status_code             INTEGER,
+                result_status           TEXT,
+                credits_used            INTEGER DEFAULT 0,
+                called_at               TEXT,
+                FOREIGN KEY (crd) REFERENCES firms(crd)
+            );
+
+            CREATE TABLE IF NOT EXISTS export_history (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename                TEXT,
+                record_count            INTEGER,
+                filters_used            TEXT,
+                exported_at             TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS import_history (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_file             TEXT,
+                snapshot_date           TEXT,
+                total_records           INTEGER,
+                state_registered_count  INTEGER,
+                target_aum_count        INTEGER,
+                imported_at             TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_firms_state ON firms(state);
+            CREATE INDEX IF NOT EXISTS idx_firms_aum ON firms(aum);
+            CREATE INDEX IF NOT EXISTS idx_aum_history_crd ON aum_history(crd);
+            CREATE INDEX IF NOT EXISTS idx_aum_history_date ON aum_history(snapshot_date);
+            CREATE INDEX IF NOT EXISTS idx_growth_scores_tier ON growth_scores(tier);
+            CREATE INDEX IF NOT EXISTS idx_growth_scores_composite ON growth_scores(composite_score);
+            CREATE INDEX IF NOT EXISTS idx_contacts_crd ON contacts(crd);
+            CREATE INDEX IF NOT EXISTS idx_enrichment_log_crd ON enrichment_log(crd);
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Firms
+# ---------------------------------------------------------------------------
+
+def upsert_firms(records, db_path=None):
+    """Insert or update firms. Records is a list of dicts. Returns count."""
+    if not records:
+        return 0
+    conn = get_connection(db_path)
+    now = datetime.utcnow().isoformat()
+    count = 0
+    try:
+        for r in records:
+            conn.execute("""
+                INSERT INTO firms (crd, company, legal_name, state, city, phone,
+                    website, aum, aum_discretionary, aum_nondiscretionary,
+                    employees, clients, sec_registered, filing_date, status,
+                    imported_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(crd) DO UPDATE SET
+                    company=excluded.company, legal_name=excluded.legal_name,
+                    state=excluded.state, city=excluded.city, phone=excluded.phone,
+                    website=excluded.website, aum=excluded.aum,
+                    aum_discretionary=excluded.aum_discretionary,
+                    aum_nondiscretionary=excluded.aum_nondiscretionary,
+                    employees=excluded.employees, clients=excluded.clients,
+                    sec_registered=excluded.sec_registered,
+                    filing_date=excluded.filing_date, status=excluded.status,
+                    updated_at=excluded.updated_at
+            """, (
+                r.get('crd'), r.get('company'), r.get('legal_name'),
+                r.get('state'), r.get('city'), r.get('phone'), r.get('website'),
+                r.get('aum'), r.get('aum_discretionary'), r.get('aum_nondiscretionary'),
+                r.get('employees'), r.get('clients'), r.get('sec_registered'),
+                r.get('filing_date'), r.get('status'), now, now,
+            ))
+            count += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return count
+
+
+def get_firms(db_path=None, state=None, min_aum=None, max_aum=None):
+    """Query firms with optional filters. Returns list of dicts."""
+    conn = get_connection(db_path)
+    try:
+        query = "SELECT * FROM firms WHERE 1=1"
+        params = []
+        if state:
+            query += " AND state = ?"
+            params.append(state)
+        if min_aum is not None:
+            query += " AND aum >= ?"
+            params.append(min_aum)
+        if max_aum is not None:
+            query += " AND aum <= ?"
+            params.append(max_aum)
+        query += " ORDER BY company"
+        rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_firm_by_crd(crd, db_path=None):
+    """Get a single firm by CRD number."""
+    conn = get_connection(db_path)
+    try:
+        row = conn.execute("SELECT * FROM firms WHERE crd = ?", (crd,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_distinct_states(db_path=None):
+    """Get all distinct states from firms table."""
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT state FROM firms WHERE state IS NOT NULL ORDER BY state"
+        ).fetchall()
+        return [row['state'] for row in rows]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# AUM History
+# ---------------------------------------------------------------------------
+
+def upsert_aum_history(records, db_path=None):
+    """Insert or update AUM history snapshots. Records: list of dicts with
+    keys: crd, snapshot_date, aum, aum_discretionary, employees, clients.
+    Returns count of rows affected.
+    """
+    if not records:
+        return 0
+    conn = get_connection(db_path, foreign_keys=False)
+    count = 0
+    try:
+        for r in records:
+            conn.execute("""
+                INSERT INTO aum_history (crd, snapshot_date, aum, aum_discretionary,
+                    employees, clients)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(crd, snapshot_date) DO UPDATE SET
+                    aum=excluded.aum,
+                    aum_discretionary=excluded.aum_discretionary,
+                    employees=excluded.employees,
+                    clients=excluded.clients
+            """, (
+                r.get('crd'), r.get('snapshot_date'), r.get('aum'),
+                r.get('aum_discretionary'), r.get('employees'), r.get('clients'),
+            ))
+            count += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return count
+
+
+def get_aum_history(crd, db_path=None):
+    """Get AUM history for a firm, ordered by snapshot date."""
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM aum_history WHERE crd = ? ORDER BY snapshot_date",
+            (crd,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_firms_with_history_count(db_path=None):
+    """Get count of firms that have multiple AUM history snapshots."""
+    conn = get_connection(db_path)
+    try:
+        row = conn.execute("""
+            SELECT COUNT(DISTINCT crd) as n FROM aum_history
+            GROUP BY crd HAVING COUNT(*) >= 2
+        """).fetchall()
+        return len(row)
+    finally:
+        conn.close()
+
+
+def get_snapshot_dates(db_path=None):
+    """Get all distinct snapshot dates in the aum_history table."""
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT snapshot_date FROM aum_history ORDER BY snapshot_date"
+        ).fetchall()
+        return [row['snapshot_date'] for row in rows]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Growth Scores
+# ---------------------------------------------------------------------------
+
+def upsert_growth_score(crd, score_data, db_path=None):
+    """Insert or update a growth score for a firm."""
+    conn = get_connection(db_path)
+    now = datetime.utcnow().isoformat()
+    try:
+        conn.execute("""
+            INSERT INTO growth_scores (crd, yoy_growth_latest, yoy_growth_avg,
+                growth_years, proximity_score, acceleration, composite_score,
+                tier, score_details, scored_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(crd) DO UPDATE SET
+                yoy_growth_latest=excluded.yoy_growth_latest,
+                yoy_growth_avg=excluded.yoy_growth_avg,
+                growth_years=excluded.growth_years,
+                proximity_score=excluded.proximity_score,
+                acceleration=excluded.acceleration,
+                composite_score=excluded.composite_score,
+                tier=excluded.tier,
+                score_details=excluded.score_details,
+                scored_at=excluded.scored_at
+        """, (
+            crd, score_data.get('yoy_growth_latest'), score_data.get('yoy_growth_avg'),
+            score_data.get('growth_years'), score_data.get('proximity_score'),
+            score_data.get('acceleration'), score_data.get('composite_score'),
+            score_data.get('tier'), score_data.get('score_details'), now,
+        ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_growth_scores(db_path=None, tier=None, min_score=None):
+    """Get growth scores with optional filters. Returns list of dicts."""
+    conn = get_connection(db_path)
+    try:
+        query = """
+            SELECT g.*, f.company, f.state, f.aum, f.website, f.filing_date
+            FROM growth_scores g
+            JOIN firms f ON g.crd = f.crd
+            WHERE 1=1
+        """
+        params = []
+        if tier:
+            query += " AND g.tier = ?"
+            params.append(tier)
+        if min_score is not None:
+            query += " AND g.composite_score >= ?"
+            params.append(min_score)
+        query += " ORDER BY g.composite_score DESC"
+        rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_hot_list(limit=50, db_path=None):
+    """Get the top-ranked firms by composite growth score."""
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute("""
+            SELECT g.*, f.company, f.state, f.aum, f.website, f.phone,
+                   f.employees, f.clients, f.filing_date
+            FROM growth_scores g
+            JOIN firms f ON g.crd = f.crd
+            ORDER BY g.composite_score DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Form ADV Details (CCO)
+# ---------------------------------------------------------------------------
+
+def upsert_form_adv(crd, details, db_path=None):
+    """Insert or update Form ADV details for a firm."""
+    conn = get_connection(db_path)
+    now = datetime.utcnow().isoformat()
+    try:
+        conn.execute("""
+            INSERT INTO form_adv_details (crd, cco_name, cco_email, cco_phone,
+                state_registrations, state_count, scraped_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(crd) DO UPDATE SET
+                cco_name=excluded.cco_name, cco_email=excluded.cco_email,
+                cco_phone=excluded.cco_phone,
+                state_registrations=excluded.state_registrations,
+                state_count=excluded.state_count, scraped_at=excluded.scraped_at
+        """, (
+            crd, details.get('cco_name'), details.get('cco_email'),
+            details.get('cco_phone'), details.get('state_registrations'),
+            details.get('state_count'), now,
+        ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_form_adv(crd, db_path=None):
+    """Get Form ADV details for a firm."""
+    conn = get_connection(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM form_adv_details WHERE crd = ?", (crd,)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_unprocessed_crds(crd_list, max_age_days=30, db_path=None):
+    """Return CRDs from the list that have no Form ADV data or stale data."""
+    if not crd_list:
+        return []
+    conn = get_connection(db_path)
+    cutoff = (datetime.utcnow() - timedelta(days=max_age_days)).isoformat()
+    try:
+        stale = []
+        for i in range(0, len(crd_list), 500):
+            chunk = crd_list[i:i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(f"""
+                SELECT crd FROM form_adv_details
+                WHERE crd IN ({placeholders}) AND scraped_at > ?
+            """, chunk + [cutoff]).fetchall()
+            fresh = {row['crd'] for row in rows}
+            stale.extend(c for c in chunk if c not in fresh)
+        return stale
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Contacts
+# ---------------------------------------------------------------------------
+
+def _parse_name(full_name):
+    """Split 'First Last' into (first_name, last_name)."""
+    if not full_name:
+        return None, None
+    parts = full_name.strip().split()
+    if not parts:
+        return None, None
+    if len(parts) == 1:
+        return parts[0], None
+    return parts[0], parts[-1]
+
+
+def insert_contact(crd, contact, db_path=None):
+    """Insert a contact for a firm. Returns the new contact ID."""
+    conn = get_connection(db_path)
+    now = datetime.utcnow().isoformat()
+    try:
+        parsed_first, parsed_last = _parse_name(contact.get('contact_name'))
+        first_name = contact.get('first_name') or parsed_first
+        last_name = contact.get('last_name') or parsed_last
+        conn.execute("""
+            INSERT INTO contacts (crd, contact_name, first_name, last_name,
+                contact_email, contact_title, contact_phone, contact_linkedin,
+                source, confidence, enriched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            crd, contact.get('contact_name'), first_name, last_name,
+            contact.get('contact_email'), contact.get('contact_title'),
+            contact.get('contact_phone'), contact.get('contact_linkedin'),
+            contact.get('source'), contact.get('confidence', 0), now,
+        ))
+        conn.commit()
+        return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def delete_contacts_for_firm(crd, db_path=None):
+    """Delete all contacts for a firm (used before re-processing)."""
+    conn = get_connection(db_path)
+    try:
+        conn.execute("DELETE FROM contacts WHERE crd = ?", (crd,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_contacts_for_firm(crd, db_path=None):
+    """Get all contacts for a firm."""
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM contacts WHERE crd = ? ORDER BY contact_title, contact_name",
+            (crd,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_all_contacts_with_firms(db_path=None):
+    """Join all contacts with firm data for display/export."""
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute("""
+            SELECT c.id, c.crd, f.company, f.state, f.website, f.aum,
+                   c.contact_name, c.first_name, c.last_name,
+                   c.contact_email, c.contact_title, c.contact_phone,
+                   c.contact_linkedin, c.source, c.confidence, c.enriched_at
+            FROM contacts c
+            JOIN firms f ON c.crd = f.crd
+            ORDER BY f.company, c.contact_title
+        """).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_contact_stats(db_path=None):
+    """Get summary contact statistics."""
+    conn = get_connection(db_path)
+    try:
+        total = conn.execute("SELECT COUNT(*) as n FROM contacts").fetchone()['n']
+        with_email = conn.execute(
+            "SELECT COUNT(*) as n FROM contacts WHERE contact_email IS NOT NULL"
+        ).fetchone()['n']
+        firms_processed = conn.execute(
+            "SELECT COUNT(*) as n FROM form_adv_details"
+        ).fetchone()['n']
+        return {
+            'total_contacts': total,
+            'with_email': with_email,
+            'without_email': total - with_email,
+            'firms_processed': firms_processed,
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Enrichment Log
+# ---------------------------------------------------------------------------
+
+def log_enrichment(crd, api_source, endpoint, status_code, result_status,
+                   credits_used=0, db_path=None):
+    """Log an API call for auditing."""
+    conn = get_connection(db_path)
+    now = datetime.utcnow().isoformat()
+    try:
+        conn.execute("""
+            INSERT INTO enrichment_log (crd, api_source, endpoint, status_code,
+                result_status, credits_used, called_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (crd, api_source, endpoint, status_code, result_status, credits_used, now))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_enrichment_stats(db_path=None):
+    """Get summary stats for enrichment API usage."""
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute("""
+            SELECT api_source,
+                   COUNT(*) as total_calls,
+                   SUM(credits_used) as total_credits,
+                   SUM(CASE WHEN result_status='success' THEN 1 ELSE 0 END) as successes,
+                   SUM(CASE WHEN result_status='error' THEN 1 ELSE 0 END) as errors
+            FROM enrichment_log
+            GROUP BY api_source
+        """).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Import History
+# ---------------------------------------------------------------------------
+
+def log_import(source_file, snapshot_date, total_records,
+               state_registered_count, target_aum_count, db_path=None):
+    """Log a data import event."""
+    conn = get_connection(db_path)
+    now = datetime.utcnow().isoformat()
+    try:
+        conn.execute("""
+            INSERT INTO import_history (source_file, snapshot_date, total_records,
+                state_registered_count, target_aum_count, imported_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (source_file, snapshot_date, total_records,
+              state_registered_count, target_aum_count, now))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_import_history(db_path=None):
+    """Get import history."""
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM import_history ORDER BY imported_at DESC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Export History
+# ---------------------------------------------------------------------------
+
+def log_export(filename, record_count, filters_used, db_path=None):
+    """Log a CSV export."""
+    conn = get_connection(db_path)
+    now = datetime.utcnow().isoformat()
+    try:
+        conn.execute(
+            "INSERT INTO export_history (filename, record_count, filters_used, exported_at) VALUES (?, ?, ?, ?)",
+            (filename, record_count, filters_used, now)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_export_history(db_path=None):
+    """Get export history."""
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM export_history ORDER BY exported_at DESC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Pipeline Stats
+# ---------------------------------------------------------------------------
+
+def get_pipeline_stats(db_path=None):
+    """Get summary stats for the pipeline."""
+    conn = get_connection(db_path)
+    try:
+        total = conn.execute("SELECT COUNT(*) as n FROM firms").fetchone()['n']
+        scored = conn.execute("SELECT COUNT(*) as n FROM growth_scores").fetchone()['n']
+        processed = conn.execute("SELECT COUNT(*) as n FROM form_adv_details").fetchone()['n']
+        total_contacts = conn.execute("SELECT COUNT(*) as n FROM contacts").fetchone()['n']
+        with_email = conn.execute(
+            "SELECT COUNT(*) as n FROM contacts WHERE contact_email IS NOT NULL"
+        ).fetchone()['n']
+        snapshots = conn.execute(
+            "SELECT COUNT(DISTINCT snapshot_date) as n FROM aum_history"
+        ).fetchone()['n']
+        hot = conn.execute(
+            "SELECT COUNT(*) as n FROM growth_scores WHERE tier = 'Hot'"
+        ).fetchone()['n']
+        return {
+            'total_firms': total,
+            'firms_scored': scored,
+            'firms_processed': processed,
+            'total_contacts': total_contacts,
+            'contacts_with_email': with_email,
+            'aum_snapshots': snapshots,
+            'hot_firms': hot,
+        }
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    init_db()
+    print(f"Database initialized at {DB_PATH}")

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.db
+*.db-wal
+*.db-shm
+.env
+.tmp/
+.streamlit/secrets.toml
+credentials.json
+token.json
