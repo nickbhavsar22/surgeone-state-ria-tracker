@@ -178,6 +178,68 @@ def _tier_badge(tier):
     return f'<span style="background:{color};color:white;padding:2px 10px;border-radius:12px;font-size:0.8rem;font-weight:600;">{tier}</span>'
 
 
+def _format_time_estimate(seconds):
+    """Format seconds into a human-readable time estimate."""
+    if seconds < 60:
+        return f"~{seconds:.0f} seconds"
+    elif seconds < 3600:
+        mins = seconds / 60
+        return f"~{mins:.1f} minutes"
+    else:
+        hrs = seconds / 3600
+        return f"~{hrs:.1f} hours"
+
+
+def _render_workflow_status(stats):
+    """Render a horizontal workflow stepper showing pipeline progress."""
+    steps = [
+        ("Import Data", stats['total_firms'] > 0, f"{stats['total_firms']} firms"),
+        ("Score Firms", stats['firms_scored'] > 0, f"{stats['firms_scored']} scored"),
+        ("Extract CCO", stats['total_contacts'] > 0, f"{stats['total_contacts']} contacts"),
+        ("Enrich", stats['contacts_with_email'] > 0, f"{stats['contacts_with_email']} with email"),
+        ("Export", False, "Ready" if stats['total_firms'] > 0 else "—"),
+    ]
+
+    html_parts = []
+    for i, (label, done, detail) in enumerate(steps):
+        # Determine state
+        if done:
+            icon = "✓"
+            bg = "#7C5CFC"
+            text_color = "#FFFFFF"
+            detail_color = "#C8B8FF"
+        elif i == 0 or steps[i - 1][1]:
+            # This is the next active step
+            icon = str(i + 1)
+            bg = "#2A2A35"
+            text_color = "#7C5CFC"
+            detail_color = "#8B8B9E"
+        else:
+            icon = str(i + 1)
+            bg = "#1E1E28"
+            text_color = "#6B7280"
+            detail_color = "#4A4A5A"
+
+        arrow = ' <span style="color:#3A3A4A;font-size:1.2rem;margin:0 4px;">→</span> ' if i < len(steps) - 1 else ''
+
+        html_parts.append(
+            f'<span style="display:inline-flex;align-items:center;gap:6px;">'
+            f'<span style="background:{bg};color:{text_color};width:24px;height:24px;'
+            f'border-radius:50%;display:inline-flex;align-items:center;justify-content:center;'
+            f'font-size:0.75rem;font-weight:700;">{icon}</span>'
+            f'<span style="color:{text_color};font-weight:600;font-size:0.82rem;">{label}</span>'
+            f'<span style="color:{detail_color};font-size:0.72rem;">{detail}</span>'
+            f'</span>{arrow}'
+        )
+
+    st.markdown(
+        f'<div style="display:flex;align-items:center;justify-content:center;flex-wrap:wrap;'
+        f'gap:4px;padding:12px 16px;background:#131318;border:1px solid #2A2A35;'
+        f'border-radius:12px;margin-bottom:12px;">{"".join(html_parts)}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main App
 # ---------------------------------------------------------------------------
@@ -234,6 +296,9 @@ def main():
         'min_growth': min_growth,
     }
 
+    # --- Workflow Status ---
+    _render_workflow_status(stats)
+
     # --- Tabs ---
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📥 Import Data",
@@ -246,11 +311,11 @@ def main():
     with tab1:
         _section_import(stats)
     with tab2:
-        _section_growth_dashboard()
+        _section_growth_dashboard(stats)
     with tab3:
-        _section_hot_list()
+        _section_hot_list(stats)
     with tab4:
-        _section_contacts()
+        _section_contacts(stats)
     with tab5:
         _section_export()
 
@@ -400,12 +465,19 @@ def _section_import(stats):
         else:
             st.caption("No imports yet.")
 
+    # Next step guidance
+    if stats['total_firms'] > 0 and stats['firms_scored'] == 0:
+        st.info(
+            "**Next step:** Go to the **Growth Dashboard** tab and click "
+            "**Score All Firms** to analyze growth patterns and rank firms."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tab 2: Growth Dashboard
 # ---------------------------------------------------------------------------
 
-def _section_growth_dashboard():
+def _section_growth_dashboard(stats=None):
     st.header("Growth Dashboard")
 
     filters = st.session_state.get('filters', {})
@@ -422,6 +494,7 @@ def _section_growth_dashboard():
     # Score firms button
     snapshots = get_snapshot_dates()
     if len(snapshots) >= 2:
+        st.caption("Scoring typically takes a few seconds.")
         if st.button("Score All Firms", type="primary", key="btn_score"):
             progress = st.progress(0, text="Scoring firms...")
             status = st.empty()
@@ -504,6 +577,13 @@ def _section_growth_dashboard():
             display_df['aum'] = display_df['aum'].apply(_format_aum)
         st.dataframe(display_df, hide_index=True, use_container_width=True)
 
+    # Next step guidance
+    if stats and stats['firms_scored'] > 0 and stats['total_contacts'] == 0:
+        st.info(
+            "**Next step:** Go to the **CCO & Contacts** tab to extract "
+            "contact information for your scored firms."
+        )
+
 
 def _render_growth_chart(crd):
     """Render a Plotly growth chart for a single firm."""
@@ -575,7 +655,7 @@ def _render_growth_chart(crd):
 # Tab 3: Hot List
 # ---------------------------------------------------------------------------
 
-def _section_hot_list():
+def _section_hot_list(stats=None):
     st.header("Hot List — Fastest Growing Firms")
 
     limit = st.selectbox("Show top:", [10, 25, 50, 100], index=1, key="hotlist_limit")
@@ -636,12 +716,19 @@ def _section_hot_list():
             if st.button(f"View Growth Chart", key=f"chart_{firm['crd']}"):
                 _render_growth_chart(firm['crd'])
 
+    # Next step guidance
+    if stats and stats['firms_scored'] > 0 and stats['total_contacts'] == 0:
+        st.info(
+            "**Ready to reach out?** Go to **CCO & Contacts** to extract contacts, "
+            "then **Export** for your Lemlist-ready CSV."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tab 4: CCO & Contacts
 # ---------------------------------------------------------------------------
 
-def _section_contacts():
+def _section_contacts(stats=None):
     st.header("CCO & Contacts")
 
     contact_stats = get_contact_stats()
@@ -655,57 +742,102 @@ def _section_contacts():
     # Action buttons
     col1, col2 = st.columns(2)
 
+    firms = get_firms()
+    crd_list = [f['crd'] for f in firms]
+    total_firms = len(crd_list)
+
     with col1:
         st.subheader("CCO Extraction")
-        st.caption("Extract CCO names from Form ADV PDFs for all firms.")
-        firms = get_firms()
-        crd_list = [f['crd'] for f in firms]
+        st.caption("Extract CCO names from Form ADV PDFs.")
 
-        if st.button("Run CCO Extraction", type="primary", key="btn_cco"):
-            progress = st.progress(0, text="Extracting CCO data...")
-            status = st.empty()
+        if total_firms == 0:
+            st.warning("No firms imported yet. Go to **Import Data** first.")
+        else:
+            # Batch size control
+            cco_presets = [n for n in [10, 25, 50, 100, 250, 500] if n < total_firms]
+            cco_presets.append(total_firms)
+            cco_labels = [str(n) if n < total_firms else f"All ({total_firms})" for n in cco_presets]
+            default_idx = min(3, len(cco_labels) - 1)  # default ~100 or All
 
-            def _on_cco_progress(current, total, res):
-                progress.progress(current / total, text=f"Processing {current}/{total}...")
-                status.text(
-                    f"Processed: {res['processed']} | "
-                    f"CSV: {res['csv_extracted']} | PDF: {res['pdf_extracted']} | "
-                    f"Errors: {res['errors']}"
-                )
-
-            result = extract_cco_batch(crd_list, progress_callback=_on_cco_progress)
-            progress.progress(1.0, text="CCO extraction complete!")
-            status.empty()
-            st.success(
-                f"Found **{result['contacts_found']}** contacts "
-                f"(CSV: {result['csv_extracted']}, PDF: {result['pdf_extracted']})"
+            cco_batch_label = st.select_slider(
+                "Firms to process",
+                options=cco_labels,
+                value=cco_labels[default_idx],
+                key="cco_batch_size",
             )
-            st.rerun()
+            cco_batch_size = cco_presets[cco_labels.index(cco_batch_label)]
+
+            est_seconds = cco_batch_size * 1.5
+            st.caption(f"Estimated time: **{_format_time_estimate(est_seconds)}** ({cco_batch_size} firms x 1.5 sec/firm)")
+
+            if st.button("Run CCO Extraction", type="primary", key="btn_cco"):
+                batch = crd_list[:cco_batch_size]
+                progress = st.progress(0, text="Extracting CCO data...")
+                status = st.empty()
+
+                def _on_cco_progress(current, total, res):
+                    progress.progress(current / total, text=f"Processing {current}/{total}...")
+                    status.text(
+                        f"Processed: {res['processed']} | "
+                        f"CSV: {res['csv_extracted']} | PDF: {res['pdf_extracted']} | "
+                        f"Errors: {res['errors']}"
+                    )
+
+                result = extract_cco_batch(batch, progress_callback=_on_cco_progress)
+                progress.progress(1.0, text="CCO extraction complete!")
+                status.empty()
+                st.success(
+                    f"Found **{result['contacts_found']}** contacts "
+                    f"(CSV: {result['csv_extracted']}, PDF: {result['pdf_extracted']})"
+                )
+                st.rerun()
 
     with col2:
         st.subheader("Website Enrichment")
-        st.caption("Scrape firm websites for additional contact emails and phone numbers.")
-        if st.button("Run Website Scrape", type="primary", key="btn_enrich"):
-            progress = st.progress(0, text="Scraping websites...")
-            status = st.empty()
+        st.caption("Scrape firm websites for emails and phone numbers.")
 
-            def _on_enrich_progress(current, total, res):
-                progress.progress(current / total, text=f"Enriching {current}/{total}...")
-                status.text(
-                    f"Enriched: {res['enriched']} | "
-                    f"Emails: {res['emails_found']} | "
-                    f"Unresolved: {res['unresolved_count']}"
-                )
+        if total_firms == 0:
+            st.warning("No firms imported yet. Go to **Import Data** first.")
+        else:
+            # Batch size control
+            enrich_presets = [n for n in [10, 25, 50, 100, 250] if n < total_firms]
+            enrich_presets.append(total_firms)
+            enrich_labels = [str(n) if n < total_firms else f"All ({total_firms})" for n in enrich_presets]
+            default_idx = min(2, len(enrich_labels) - 1)  # default ~50 or All
 
-            result = enrich_batch(crd_list, progress_callback=_on_enrich_progress)
-            progress.progress(1.0, text="Enrichment complete!")
-            status.empty()
-            st.success(
-                f"Enriched **{result['enriched']}** firms, "
-                f"found **{result['emails_found']}** emails "
-                f"({result['unresolved_count']} need manual enrichment)"
+            enrich_batch_label = st.select_slider(
+                "Firms to enrich",
+                options=enrich_labels,
+                value=enrich_labels[default_idx],
+                key="enrich_batch_size",
             )
-            st.rerun()
+            enrich_batch_size = enrich_presets[enrich_labels.index(enrich_batch_label)]
+
+            est_seconds = enrich_batch_size * 15
+            st.caption(f"Estimated time: **{_format_time_estimate(est_seconds)}** ({enrich_batch_size} firms x ~15 sec/firm)")
+
+            if st.button("Run Website Enrichment", type="primary", key="btn_enrich"):
+                batch = crd_list[:enrich_batch_size]
+                progress = st.progress(0, text="Scraping websites...")
+                status = st.empty()
+
+                def _on_enrich_progress(current, total, res):
+                    progress.progress(current / total, text=f"Enriching {current}/{total}...")
+                    status.text(
+                        f"Enriched: {res['enriched']} | "
+                        f"Emails: {res['emails_found']} | "
+                        f"Unresolved: {res['unresolved_count']}"
+                    )
+
+                result = enrich_batch(batch, progress_callback=_on_enrich_progress)
+                progress.progress(1.0, text="Enrichment complete!")
+                status.empty()
+                st.success(
+                    f"Enriched **{result['enriched']}** firms, "
+                    f"found **{result['emails_found']}** emails "
+                    f"({result['unresolved_count']} need manual enrichment)"
+                )
+                st.rerun()
 
     st.divider()
 
@@ -752,6 +884,13 @@ def _section_contacts():
                 st.text(f"{s['api_source']}: {s['total_calls']} calls, {s['successes']} successes")
         else:
             st.text("No API calls yet")
+
+    # Next step guidance
+    if stats and stats['total_contacts'] > 0:
+        st.info(
+            "**Next step:** Go to the **Export** tab to download your "
+            "Lemlist-ready CSV with all contact data."
+        )
 
 
 # ---------------------------------------------------------------------------
